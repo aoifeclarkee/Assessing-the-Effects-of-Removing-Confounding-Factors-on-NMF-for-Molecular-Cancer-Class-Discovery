@@ -1,0 +1,888 @@
+---
+title: "lung cancer - gender bootstrap"
+author: "AC"
+date: "2025-03-13"
+output: html_document
+---
+
+
+```{r include=FALSE}
+#Required packages
+library(Biobase)
+library(mclust)
+library(clue)
+library(pdfCluster)
+library(NMF)
+library(funtimes)
+library(ggplot2)
+library(plotrix)
+library(fpc)
+library(cluster)
+library(aricode)
+library(dplyr)
+library(corrplot)
+library(limma)
+library(tidyr)
+library(DESeq2)
+library(kableExtra)
+library(edgeR)
+library(GEOquery)
+```
+
+```{r}
+# Download and load the dataset
+gse <- getGEO("GSE4115", GSEMatrix = TRUE)
+gse <- gse[[1]]
+
+```
+
+
+```{r}
+# Extract the expression matrix
+exprs <- exprs(gse)
+
+dim(exprs)
+
+```
+
+```{r}
+# Extract sample metadata
+sample_metadata <- pData(gse)
+
+
+list(sample_metadata)
+head(sample_metadata)
+
+```
+
+```{r}
+# Extract feature data
+features_data <- fData(gse)
+
+
+head(features_data)
+
+```
+
+```{r}
+# Save the expression matrix 
+write.table(exprs, "lungcancer_matrix.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+# Save the sample metadata 
+write.table(sample_metadata, "lungcancer_metadata.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+# Save the feature data 
+write.table(features_data, "lungcancer_features.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+
+
+```
+
+```{r}
+# Check if pData is a data frame
+class(pData(gse))
+
+# Check if fData is a data frame
+class(fData(gse))
+
+
+pData_df <- as.data.frame(pData(gse))
+fData_df <- as.data.frame(fData(gse))
+
+```
+
+```{r}
+phenoData <- AnnotatedDataFrame(data = pData_df)
+featureData <- AnnotatedDataFrame(data = fData_df)
+
+
+```
+
+```{r}
+#Makes an expression set from the expression matrix, phenotype data (sample), feature data (gene)
+eset <- ExpressionSet(assayData = exprs,
+                      phenoData = phenoData,
+                      featureData = featureData)
+
+
+dim(eset)
+
+```
+
+```{r}
+# Assign the expression matrix as 'A'
+A <- exprs(eset)
+```
+
+```{r}
+# Data Pre-processing
+
+# Replace any NA with the average value of non-NA values across that row
+
+exprs <- t(apply(exprs, 1, function(row) {
+  missing_values <- is.na(row)
+  if (any(!missing_values)) {
+    mean_value <- mean(row[!missing_values], na.rm = TRUE)
+    row[missing_values] <- mean_value
+  }
+  return(row)
+}))
+
+# Remove all genes with zero values across the rows
+
+exprs <- exprs[apply(exprs, 1, function(row) all(row !=0 )), ]
+
+
+# Select the top 1000 most variably expressed genes
+
+exprs <- exprs[order(apply(exprs, 1, var), decreasing = TRUE)[1:1000], ]
+
+head(exprs)
+
+```
+
+```{r}
+# subtype labels
+print(unique(sample_metadata$`cancer_status:ch1`))  
+
+```
+```{r}
+groundtruths <- ifelse(sample_metadata$`cancer_status:ch1` == "Cancer", 1, 
+                ifelse(sample_metadata$`cancer_status:ch1` == "No Cancer", 2, NA))
+
+names(groundtruths) <- rownames(sample_metadata)
+print(table(groundtruths))
+
+```
+
+```{r}
+print(table(sample_metadata$`gender:ch1`))
+```
+
+```{r}
+exprs <- exprs[, colnames(exprs) %in% rownames(sample_metadata)]
+
+
+exprs <- exprs[, match(rownames(sample_metadata), colnames(exprs))]
+
+
+print(dim(exprs))  
+print(dim(sample_metadata))  
+
+```
+```{r}
+# Find samples with NA in cancer status
+na_samples <- rownames(sample_metadata[is.na(sample_metadata$`cancer_status:ch1`), ])
+print(na_samples)  
+```
+```{r}
+# Keep only samples that have a known cancer status
+sample_metadata <- sample_metadata[!is.na(sample_metadata$`cancer_status:ch1`), ]
+
+
+print(dim(sample_metadata))  
+```
+```{r}
+# Ensure exprs has only valid samples
+exprs <- exprs[, colnames(exprs) %in% rownames(sample_metadata)]
+
+
+exprs <- exprs[, match(rownames(sample_metadata), colnames(exprs))]
+
+
+print(dim(exprs))  
+print(dim(sample_metadata))  
+```
+
+```{r}
+# Remove DEGs between male and female samples
+
+# Create the model matrix 
+design <- model.matrix(~ factor(sample_metadata$`gender:ch1`))
+colnames(design) <- c("Intercept", "MALE_vs_FEMALE")
+
+# Check design matrix dimensions
+print(dim(design))  
+
+
+fit <- lmFit(exprs, design)
+fit <- eBayes(fit)
+
+# Extract DEGs 
+deg_results <- topTable(fit, coef = "MALE_vs_FEMALE", number = Inf, adjust.method = "fdr")
+
+# Filter significant DEGs 
+degs <- deg_results[deg_results$adj.P.Val < 0.05 & abs(deg_results$logFC) > 0.5, ]
+
+
+dim(degs)
+list(degs)
+
+# genes to remove
+genes_to_remove <- rownames(degs)
+
+# Remove DEGs from expression matrix
+filtered_exprs_gender <- exprs[!(rownames(exprs) %in% genes_to_remove), ]
+
+
+dim(filtered_exprs_gender)
+```
+```{r}
+# Non-Negative Matrix Factorization 
+
+# Set the rank to the number of classes- smokers with lung cancer, smokers without lung cancer
+rank <- 2
+num_runs <- 100
+
+# NMF results lists
+nmf_results_original <- list()
+nmf_results_filtered <- list()
+
+# Run NMF on original and filtered expression matrices
+for (x in 1:num_runs) {
+  nmf_result_original <- nmf(exprs, rank = rank, nrun = 1, seed = "random")
+  nmf_results_original[[as.character(x)]] <- nmf_result_original
+  
+  nmf_result_filtered <- nmf(filtered_exprs_gender, rank = rank, nrun = 1, seed = "random")
+  nmf_results_filtered[[as.character(x)]] <- nmf_result_filtered
+}
+
+```
+
+
+```{r}
+# Predict Clusters and Align with Groundtruths
+
+# lists for cluster predictions
+predictions_original <- list()
+predictions_filtered <- list()
+
+# Generate cluster assignments for each NMF run
+for (x in 1:num_runs) {
+
+# Original dataset clustering
+  H_matrix <- coef(nmf_results_original[[x]])
+  cluster_predictions <- apply(H_matrix, 2, which.max)
+  names(cluster_predictions) <- colnames(exprs)
+  
+  
+  common_samples <- intersect(names(cluster_predictions), names(groundtruths))
+  if (length(common_samples) > 0) {
+    predictions_original[[as.character(x)]] <- unify_labels(cluster_predictions[common_samples], groundtruths[common_samples])
+  } else {
+    predictions_original[[as.character(x)]] <- rep(NA, length(cluster_predictions))
+  }
+
+# Filtered dataset clustering
+  H_matrix_filtered <- coef(nmf_results_filtered[[x]])
+  cluster_predictions_filtered <- apply(H_matrix_filtered, 2, which.max)
+  names(cluster_predictions_filtered) <- colnames(filtered_exprs_gender)
+  
+ 
+  common_samples_filtered <- intersect(names(cluster_predictions_filtered), names(groundtruths))
+  if (length(common_samples_filtered) > 0) {
+    predictions_filtered[[as.character(x)]] <- unify_labels(cluster_predictions_filtered[common_samples_filtered], groundtruths[common_samples_filtered])
+  } else {
+    predictions_filtered[[as.character(x)]] <- rep(NA, length(cluster_predictions_filtered))
+  }
+}
+
+# first few predictions
+print("First few predictions (Original):")
+print(head(predictions_original[[1]]))
+
+print("First few predictions (Filtered):")
+print(head(predictions_filtered[[1]]))
+
+```
+
+```{r}
+# Purity
+
+# Calculate purity
+calculate_purity <- function(predicted_labels, groundtruths) {
+  contingency_table <- table(predicted_labels, groundtruths)
+  sum(apply(contingency_table, 1, max)) / length(groundtruths)
+}
+
+# Purity for each NMF run
+purity_original <- sapply(predictions_original, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) calculate_purity(pred, groundtruths) else NA
+})
+
+# Filtered
+purity_filtered <- sapply(predictions_filtered, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) calculate_purity(pred, groundtruths) else NA
+})
+
+summary(purity_original)
+summary(purity_filtered)
+
+
+# Calculate mean purity and standard deviation 
+purity_average <- list(
+  Original = mean(purity_original, na.rm = TRUE),
+  Filtered = mean(purity_filtered, na.rm = TRUE)
+)
+
+sdpurity <- list(
+  Original = sd(purity_original, na.rm = TRUE),
+  Filtered = sd(purity_filtered, na.rm = TRUE)
+)
+
+
+print(purity_average)
+print(sdpurity)
+
+# Create purity table
+purity_table <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Average_Purity = c(mean(purity_original, na.rm = TRUE), mean(purity_filtered, na.rm = TRUE)),
+  SD = c(sd(purity_original, na.rm = TRUE), sd(purity_filtered, na.rm = TRUE))  
+)
+
+
+print(purity_table)
+
+```
+```{r}
+# Adjusted Rand Index
+
+# Compute ARI for each NMF run
+ARI_original <- sapply(predictions_original, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) adjustedRandIndex(pred, groundtruths) else NA
+})
+
+ARI_filtered <- sapply(predictions_filtered, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) adjustedRandIndex(pred, groundtruths) else NA
+})
+
+# Calculate mean ARI and standard deviation 
+ARI_table <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Average_ARI = c(mean(ARI_original, na.rm = TRUE), mean(ARI_filtered, na.rm = TRUE)),
+  SD_ARI = c(sd(ARI_original, na.rm = TRUE), sd(ARI_filtered, na.rm = TRUE))  
+)
+
+
+print(ARI_table)
+
+```
+
+
+
+```{r}
+
+# Keep only samples that do not have NA cancer status
+groundtruths <- groundtruths[!is.na(groundtruths)]
+
+
+print(sum(is.na(groundtruths)))  
+print(length(groundtruths))  
+
+
+predictions_original <- lapply(predictions_original, function(pred) {
+  
+# Remove any NA values and keep only valid samples
+  pred <- pred[!is.na(pred)]
+  pred <- pred[names(pred) %in% names(groundtruths)]
+  
+
+  pred <- pred[match(names(groundtruths), names(pred))]
+  
+  return(pred)
+})
+
+
+na_counts <- sapply(predictions_original, function(pred) sum(is.na(pred)))
+print(na_counts)  
+```
+
+
+
+```{r}
+# Normalised Mutual Information
+
+# Compute NMI for each NMF run
+NMI_original <- sapply(predictions_original, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) NMI(pred, groundtruths) else NA
+})
+
+NMI_filtered <- sapply(predictions_filtered, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) NMI(pred, groundtruths) else NA
+})
+
+# Calculate mean NMI and standard deviation
+NMI_table <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Average_NMI = c(mean(NMI_original, na.rm = TRUE), mean(NMI_filtered, na.rm = TRUE)),
+  SD_NMI = c(sd(NMI_original, na.rm = TRUE), sd(NMI_filtered, na.rm = TRUE))
+)
+
+
+print(NMI_table)
+
+```
+
+```{r}
+# Post-processing - Normalisation
+
+# Extract W and H matrices
+W_matrices_original <- list()
+W_matrices_filtered <- list()
+H_matrices_original <- list()
+H_matrices_filtered <- list()
+
+# Store extracted basis (W) and coefficient (H) matrices
+for (x in 1:100) {
+  W_matrices_original[[as.character(x)]] <- basis(nmf_results_original[[x]])
+  W_matrices_filtered[[as.character(x)]] <- basis(nmf_results_filtered[[x]])
+  H_matrices_original[[as.character(x)]] <- coef(nmf_results_original[[x]])
+  H_matrices_filtered[[as.character(x)]] <- coef(nmf_results_filtered[[x]])
+}
+
+# Normalise W and adjust H 
+for (x in 1:100) {
+  # Original data normalization
+  max_values_original <- apply(W_matrices_original[[as.character(x)]], 2, max)
+  W_matrices_original[[as.character(x)]] <- W_matrices_original[[as.character(x)]] / max_values_original
+  H_matrices_original[[as.character(x)]] <- H_matrices_original[[as.character(x)]] * max_values_original
+  
+# Filtered data normalisation
+  max_values_filtered <- apply(W_matrices_filtered[[as.character(x)]], 2, max)
+  W_matrices_filtered[[as.character(x)]] <- W_matrices_filtered[[as.character(x)]] / max_values_filtered
+  H_matrices_filtered[[as.character(x)]] <- H_matrices_filtered[[as.character(x)]] * max_values_filtered
+}
+
+```
+
+```{r}
+# Cluster Prediction from H Matrices
+predicted_clusters_original <- list()
+predicted_clusters_filtered <- list()
+H_clusters_original <- list()
+H_clusters_filtered <- list()
+
+for (x in 1:100) {
+  H_matrix_original <- H_matrices_original[[as.character(x)]]
+  H_matrix_filtered <- H_matrices_filtered[[as.character(x)]]
+
+  if (!is.null(H_matrix_original)) {
+    cluster_assignments_original <- apply(H_matrix_original, 2, which.max)
+    predicted_clusters_original[[as.character(x)]] <- cluster_assignments_original
+    H_clusters_original[[as.character(x)]] <- unify_labels(cluster_assignments_original, groundtruths)
+  }
+
+  if (!is.null(H_matrix_filtered)) {
+    cluster_assignments_filtered <- apply(H_matrix_filtered, 2, which.max)
+    predicted_clusters_filtered[[as.character(x)]] <- cluster_assignments_filtered
+    H_clusters_filtered[[as.character(x)]] <- unify_labels(cluster_assignments_filtered, groundtruths)
+  }
+}
+
+```
+
+```{r}
+# Post-processing - Purity 
+
+purity_post_original <- sapply(H_clusters_original, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) calculate_purity(pred, groundtruths) else NA
+})
+
+purity_post_filtered <- sapply(H_clusters_filtered, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) calculate_purity(pred, groundtruths) else NA
+})
+
+
+purity_post_table <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Average_Purity = c(mean(purity_post_original, na.rm = TRUE), mean(purity_post_filtered, na.rm = TRUE)),
+  SD_Purity = c(sd(purity_post_original, na.rm = TRUE), sd(purity_post_filtered, na.rm = TRUE))  
+)
+
+# post-processing purity table
+print(purity_post_table)
+
+```
+```{r}
+# Bootstrap - Purity
+
+  
+num_bootstraps <- 1000  
+
+# Bootstrap function
+bootstrap_purity <- function(purity_values) {
+  boot_samples <- replicate(num_bootstraps, {
+    resample <- sample(purity_values, replace = TRUE)
+    mean(resample, na.rm = TRUE)
+  })
+  return(boot_samples)
+}
+
+
+boot_purity_original <- bootstrap_purity(purity_post_original)
+boot_purity_filtered <- bootstrap_purity(purity_post_filtered)
+
+# Bootstrap purity table
+boot_purity_table <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Mean_Purity = c(mean(boot_purity_original), mean(boot_purity_filtered)),
+  SD_Purity = c(sd(boot_purity_original), sd(boot_purity_filtered))  
+)
+
+
+print(boot_purity_table)
+
+```
+
+```{r}
+# Plot Bootstrap Purity scores
+
+# data frame for plotting
+boot_purity_df <- data.frame(
+  Purity = c(boot_purity_original, boot_purity_filtered),
+  Condition = factor(rep(c("Original", "Filtered"), each = length(boot_purity_original)),
+                     levels = c("Original", "Filtered"))  
+)
+
+# Plot the boxplot
+ggplot(boot_purity_df, aes(x = Condition, y = Purity, fill = Condition)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) +  
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1.2) +  
+  scale_fill_manual(values = c("Original" = "red", "Filtered" = "darkred")) +
+  labs(title = "Bootstrap Analysis: Purity Scores",
+       x = "Condition",
+       y = "Purity Score") +
+  theme_minimal()
+
+```
+
+```{r}
+# T-test bootstrap purity
+
+# Paired t-test for bootstrapped purity values
+purity_ttest <- t.test(boot_purity_original, boot_purity_filtered, 
+                       paired = TRUE, alternative = "two.sided")
+
+
+print(purity_ttest)
+
+```
+```{r}
+# Plot t-test bootstrap purity
+
+
+purity_ttest_comparison <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Average_Purity = c(mean(boot_purity_original, na.rm = TRUE), mean(boot_purity_filtered, na.rm = TRUE)),
+  SD = c(sd(boot_purity_original, na.rm = TRUE), sd(boot_purity_filtered, na.rm = TRUE))
+)
+
+
+purity_ttest_comparison$Condition <- factor(purity_ttest_comparison$Condition, levels = c("Original", "Filtered"))
+
+# Plot results
+ggplot(purity_ttest_comparison, aes(x = Condition, y = Average_Purity, fill = Condition)) +
+  geom_bar(stat = "identity", position = position_dodge(), width = 0.6) +
+  geom_errorbar(aes(ymin = Average_Purity - SD, ymax = Average_Purity + SD), width = 0.2) +
+  scale_fill_manual(values = c("Original" = "red", "Filtered" = "darkred")) +
+  labs(title = "Bootstrapped Purity: Original vs. Filtered",
+       x = "Condition",
+       y = "Average Purity") +
+  theme_minimal()
+
+```
+
+```{r}
+# Post-processing - Adjusted Rand Index 
+
+ARI_post_original <- sapply(H_clusters_original, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) adjustedRandIndex(pred, groundtruths) else NA
+})
+
+ARI_post_filtered <- sapply(H_clusters_filtered, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) adjustedRandIndex(pred, groundtruths) else NA
+})
+
+# Calculate mean post-ARI and standard deviation
+ARI_post_table <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Average_ARI = c(mean(ARI_post_original, na.rm = TRUE), mean(ARI_post_filtered, na.rm = TRUE)),
+  SD_ARI = c(sd(ARI_post_original, na.rm = TRUE), sd(ARI_post_filtered, na.rm = TRUE))
+)
+
+
+print(ARI_post_table)
+
+```
+
+```{r}
+# Bootstrap Analysis for ARI
+
+
+n_bootstrap <- 1000  
+
+# Bootstrap
+bootstrap_sample <- function(ari_values, n_bootstrap) {
+  ari_values <- ari_values[!is.na(ari_values)]  
+  replicate(n_bootstrap, mean(sample(ari_values, replace = TRUE, size = length(ari_values))))
+}
+
+
+boot_ARI_original <- bootstrap_sample(ARI_post_original, n_bootstrap)
+boot_ARI_filtered <- bootstrap_sample(ARI_post_filtered, n_bootstrap)
+
+
+boot_ARI_table <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Mean_ARI = c(mean(boot_ARI_original), mean(boot_ARI_filtered)),
+  SD_ARI = c(sd(boot_ARI_original), sd(boot_ARI_filtered))
+)
+
+# Bootstrap ARI results
+print(boot_ARI_table)
+
+
+```
+
+```{r}
+# Plot Bootstrap ARI scores
+
+
+boot_ARI_df <- data.frame(
+  ARI = c(boot_ARI_original, boot_ARI_filtered),
+  Condition = factor(rep(c("Original", "Filtered"), each = length(boot_ARI_original)), 
+                     levels = c("Original", "Filtered"))  
+)
+
+# Boxplot of Bootstrap ARI Scores
+ggplot(boot_ARI_df, aes(x = Condition, y = ARI, fill = Condition)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1.2) +  
+  labs(title = "Bootstrap Analysis: ARI Scores",
+       x = "Condition",
+       y = "ARI Score") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Original" = "red", "Filtered" = "darkred"))
+
+
+```
+
+```{r}
+# T-test bootstrap ARI
+
+# Paired t-test between bootstrapped ARI values
+ARI_ttest <- t.test(boot_ARI_original, boot_ARI_filtered, 
+                    paired = TRUE, alternative = "two.sided")
+
+
+print(ARI_ttest)
+
+```
+```{r}
+# Plot t-test bootstrap ARI
+
+
+ARI_ttest_comparison <- data.frame(
+  Condition = factor(c("Original", "Filtered"), levels = c("Original", "Filtered")),
+  Average_ARI = c(mean(boot_ARI_original, na.rm = TRUE), mean(boot_ARI_filtered, na.rm = TRUE)),
+  SD_ARI = c(sd(boot_ARI_original, na.rm = TRUE), sd(boot_ARI_filtered, na.rm = TRUE))
+)
+
+# Plot
+ggplot(ARI_ttest_comparison, aes(x = Condition, y = Average_ARI, fill = Condition)) +
+  geom_bar(stat = "identity", position = position_dodge(), width = 0.6) +
+  geom_errorbar(aes(ymin = Average_ARI - SD_ARI, ymax = Average_ARI + SD_ARI), width = 0.2) +
+  scale_fill_manual(values = c("Original" = "red", "Filtered" = "darkred")) +
+  labs(title = "Bootstrapped ARI: Original vs. Filtered",
+       x = "Condition",
+       y = "Average ARI ± SD") +
+  theme_minimal()
+
+```
+
+```{r}
+# Post-processing - Normalised Mutual Information 
+
+NMI_post_original <- sapply(H_clusters_original, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) NMI(pred, groundtruths) else NA
+})
+
+NMI_post_filtered <- sapply(H_clusters_filtered, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) NMI(pred, groundtruths) else NA
+})
+
+# Calculate mean post-NMI and standard deviation
+NMI_post_table <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Average_NMI = c(mean(NMI_post_original, na.rm = TRUE), mean(NMI_post_filtered, na.rm = TRUE)),
+  SD_NMI = c(sd(NMI_post_original, na.rm = TRUE), sd(NMI_post_filtered, na.rm = TRUE))  
+)
+
+
+print(NMI_post_table)
+
+```
+```{r}
+# Bootstrap analysis NMI
+
+
+bootstrap_NMI <- function(nmi_values, n_bootstrap = 1000) {
+  nmi_values <- na.omit(nmi_values)  
+  boot_samples <- replicate(n_bootstrap, mean(sample(nmi_values, replace = TRUE)))
+  return(boot_samples)
+}
+
+# Bootstrap analysis for NMI 
+boot_NMI_original <- bootstrap_NMI(NMI_post_original, n_bootstrap = 1000)
+boot_NMI_filtered <- bootstrap_NMI(NMI_post_filtered, n_bootstrap = 1000)
+
+# Calculate mean and SD 
+boot_NMI_table <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Mean_Bootstrap_NMI = c(mean(boot_NMI_original), mean(boot_NMI_filtered)),
+  SD_Bootstrap_NMI = c(sd(boot_NMI_original), sd(boot_NMI_filtered))
+)
+
+
+print(boot_NMI_table)
+
+```
+
+```{r}
+# Plot bootstrap NMI scores
+
+
+boot_NMI_df <- data.frame(
+  NMI = c(boot_NMI_original, boot_NMI_filtered),
+  Condition = factor(rep(c("Original", "Filtered"), each = length(boot_NMI_original)), 
+                     levels = c("Original", "Filtered")) 
+)
+
+# Boxplot
+ggplot(boot_NMI_df, aes(x = Condition, y = NMI, fill = Condition)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) +  
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1.2) +  
+  labs(title = "Bootstrap Analysis: Normalized Mutual Information (NMI)",
+       x = "Condition",
+       y = "Bootstrapped NMI Score") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Original" = "red", "Filtered" = "darkred"))
+
+
+```
+
+```{r}
+# T-test bootstrap NMI
+
+# Paired t-test on bootstrapped NMI values
+nmi_ttest <- t.test(boot_NMI_original, boot_NMI_filtered, 
+                     paired = TRUE, alternative = "two.sided")
+
+
+print(nmi_ttest)
+
+```
+```{r}
+# Plot T-test NMI
+
+
+nmi_ttest_comparison <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Average_NMI = c(mean(boot_NMI_original, na.rm = TRUE), mean(boot_NMI_filtered, na.rm = TRUE)),
+  SD_NMI = c(sd(boot_NMI_original, na.rm = TRUE), sd(boot_NMI_filtered, na.rm = TRUE))
+)
+
+
+nmi_ttest_comparison$Condition <- factor(nmi_ttest_comparison$Condition, levels = c("Original", "Filtered"))
+
+# Plot results
+ggplot(nmi_ttest_comparison, aes(x = Condition, y = Average_NMI, fill = Condition)) +
+  geom_bar(stat = "identity", position = position_dodge(), width = 0.6) +
+  geom_errorbar(aes(ymin = Average_NMI - SD_NMI, ymax = Average_NMI + SD_NMI), width = 0.2) +
+  scale_fill_manual(values = c("Original" = "red", "Filtered" = "darkred")) +
+  labs(title = "NMI Bootstrap T-test Comparison",
+       x = "Condition",
+       y = "Average NMI") +
+  theme_minimal()
+
+```
+
+```{r}
+# Clustering Errors
+
+# number of genes to test
+gene_counts <- seq(500, 991, by = 100)  
+
+
+clustering_errors_basic <- c()
+clustering_errors_filtered <- c()
+
+for (num_genes in gene_counts) {
+  
+
+  selected_genes <- head(order(apply(exprs, 1, var), decreasing = TRUE), num_genes)
+  exprs_subset <- exprs[selected_genes, ]
+  
+
+  selected_genes_filtered <- head(order(apply(filtered_exprs_gender, 1, var), decreasing = TRUE), num_genes)
+  exprs_filtered_subset <- filtered_exprs_gender[selected_genes_filtered, ]
+  
+# Run NMF
+  nmf_result_basic <- nmf(exprs_subset, rank = 2, nrun = 5, seed = "random")
+  nmf_result_filtered <- nmf(exprs_filtered_subset, rank = 2, nrun = 5, seed = "random")
+  
+# Extract H matrices and assign clusters
+  H_matrix_basic <- coef(nmf_result_basic)
+  predicted_clusters_basic <- apply(H_matrix_basic, 2, which.max)
+  names(predicted_clusters_basic) <- colnames(exprs_subset)  
+
+  H_matrix_filtered <- coef(nmf_result_filtered)
+  predicted_clusters_filtered <- apply(H_matrix_filtered, 2, which.max)
+  names(predicted_clusters_filtered) <- colnames(exprs_filtered_subset)  
+  
+
+  common_samples <- intersect(names(predicted_clusters_basic), names(groundtruths))
+  groundtruths_valid <- groundtruths[common_samples]
+  predicted_clusters_basic <- predicted_clusters_basic[common_samples]
+  predicted_clusters_filtered <- predicted_clusters_filtered[common_samples]
+  
+# Compute clustering error 
+  ari_basic <- adjustedRandIndex(predicted_clusters_basic, groundtruths_valid)
+  ari_filtered <- adjustedRandIndex(predicted_clusters_filtered, groundtruths_valid)
+  
+
+  clustering_errors_basic <- c(clustering_errors_basic, 1 - ari_basic)
+  clustering_errors_filtered <- c(clustering_errors_filtered, 1 - ari_filtered)
+}
+
+
+plot_data <- data.frame(
+  Number_of_Genes = rep(gene_counts, 2),
+  Errors = c(clustering_errors_basic, clustering_errors_filtered),
+  Method = rep(c("Basic NMF", "Filtered NMF"), each = length(gene_counts))
+)
+
+# Plot clustering errors
+ggplot(plot_data, aes(x = Number_of_Genes, y = Errors, color = Method, linetype = Method)) +
+  geom_line(linewidth = 1) +  
+  scale_linetype_manual(values = c("dashed", "solid")) +
+  scale_color_manual(values = c("blue", "red")) +
+  labs(title = "Clustering Errors vs. Number of Genes",
+       x = "Number of Genes",
+       y = "Clustering Errors") +
+  theme_minimal()
+
+```
+
